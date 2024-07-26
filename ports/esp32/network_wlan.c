@@ -472,6 +472,60 @@ static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(network_wlan_scan_obj, network_wlan_scan);
 
+
+static mp_obj_t network_wlan_test(size_t n_args, const mp_obj_t *arg) {
+    mp_obj_t *self = MP_OBJ_TO_PTR(arg[0]);
+    // check that STA mode is active
+    wifi_mode_t mode;
+    esp_exceptions(esp_wifi_get_mode(&mode));
+    if ((mode & WIFI_MODE_STA) == 0) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("STA must be active"));
+    }
+    int chan = 3;
+    if(n_args == 2){
+        chan = mp_obj_get_int(arg[1]);
+        if(chan < 1 || chan > 13){
+            mp_raise_ValueError(MP_ERROR_TEXT("Invalid channel"));
+        }
+    }
+
+    mp_obj_t list = mp_obj_new_list(0, NULL);
+    wifi_scan_config_t config = { 0 };
+    // Hard code the channel to 3
+    config.channel = chan;
+    config.show_hidden = true;
+    MP_THREAD_GIL_EXIT();
+    esp_err_t status = esp_wifi_scan_start(&config, 1);
+    MP_THREAD_GIL_ENTER();
+    if (status == 0) {
+        uint16_t count = 0;
+        esp_exceptions(esp_wifi_scan_get_ap_num(&count));
+        if (count == 0) {
+            // esp_wifi_scan_get_ap_records must be called to free internal buffers from the scan.
+            // But it returns an error if wifi_ap_records==NULL.  So allocate at least 1 AP entry.
+            // esp_wifi_scan_get_ap_records will then return the actual number of APs in count.
+            count = 1;
+        }
+        wifi_ap_record_t *wifi_ap_records = calloc(count, sizeof(wifi_ap_record_t));
+        esp_exceptions(esp_wifi_scan_get_ap_records(&count, wifi_ap_records));
+        for (uint16_t i = 0; i < count; i++) {
+            mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
+            uint8_t *x = memchr(wifi_ap_records[i].ssid, 0, sizeof(wifi_ap_records[i].ssid));
+            int ssid_len = x ? x - wifi_ap_records[i].ssid : sizeof(wifi_ap_records[i].ssid);
+            t->items[0] = mp_obj_new_bytes(wifi_ap_records[i].ssid, ssid_len);
+            t->items[1] = mp_obj_new_bytes(wifi_ap_records[i].bssid, sizeof(wifi_ap_records[i].bssid));
+            t->items[2] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].primary);
+            t->items[3] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].rssi);
+            t->items[4] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].authmode);
+            t->items[5] = mp_const_false; // XXX hidden?
+            mp_obj_list_append(list, MP_OBJ_FROM_PTR(t));
+        }
+        free(wifi_ap_records);
+    }
+    return list;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_wlan_test_obj, 1, 2, network_wlan_test);
+
 static mp_obj_t network_wlan_isconnected(mp_obj_t self_in) {
     wlan_if_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (self->if_id == ESP_IF_WIFI_STA) {
@@ -725,6 +779,7 @@ static const mp_rom_map_elem_t wlan_if_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_disconnect), MP_ROM_PTR(&network_wlan_disconnect_obj) },
     { MP_ROM_QSTR(MP_QSTR_status), MP_ROM_PTR(&network_wlan_status_obj) },
     { MP_ROM_QSTR(MP_QSTR_scan), MP_ROM_PTR(&network_wlan_scan_obj) },
+    { MP_ROM_QSTR(MP_QSTR_test), MP_ROM_PTR(&network_wlan_test_obj) },
     { MP_ROM_QSTR(MP_QSTR_isconnected), MP_ROM_PTR(&network_wlan_isconnected_obj) },
     { MP_ROM_QSTR(MP_QSTR_config), MP_ROM_PTR(&network_wlan_config_obj) },
     { MP_ROM_QSTR(MP_QSTR_ifconfig), MP_ROM_PTR(&esp_network_ifconfig_obj) },
