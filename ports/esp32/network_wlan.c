@@ -116,10 +116,10 @@ static mp_obj_t scan_done_cb(mp_obj_t arg){
         mp_obj_t *channels;
         unsigned int channels_len;
         ESP_LOGI("wifi_blocking_mod", "Getting the next channel from the remaining_channels list");
+        mp_obj_get_array(mp_state_ctx.vm.remaining_channels, &channels_len, &channels);
         if (channels_len == 0){
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Something wrong here?"));
         }
-        mp_obj_get_array(mp_state_ctx.vm.remaining_channels, &channels_len, &channels);
         ESP_LOGI("wifi_blocking_mod", "Setting the configuration to have channel %ld", mp_obj_get_int(channels[0]));
         scanning_config.channel = mp_obj_get_int(channels[0]);
         ESP_LOGI("wifi_blocking_mod", "Removing the channel from remaining_channels");
@@ -751,8 +751,8 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
         mp_obj_t channel_list = args[2].u_obj;
         int channel_count = mp_obj_get_int(mp_obj_len(channel_list));
         // Check if there are more channels than possible
-        if (channel_count > 13) {
-            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("More channels supplied than were "));
+        if (channel_count > 14) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("More channels supplied than were possible to scan"));
         // There were no channels given, but there was an array
         } else if(channel_count == 0){
             mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("An array with no channels to scan is invalid"));
