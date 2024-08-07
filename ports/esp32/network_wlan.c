@@ -107,6 +107,14 @@ static mp_obj_t scan_done_cb(mp_obj_t arg){
     read_wifi_scan_results();
     ESP_LOGI("wifi_blocking_mod", "Got the latest scan results");
     // See if there are any more channels that need to be scanned
+    ESP_LOGE("wifi_blocking_mod", "checking if the remaining lists is an object");
+    if(!mp_obj_is_obj(mp_state_ctx.vm.remaining_channels)){
+        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was not a real micropython object, recreating a new empty list");
+        mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
+    } else {
+        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was an object?");
+        ESP_LOGE("wifi_blocking_mod", "Type %s", mp_obj_get_type_str(mp_state_ctx.vm.remaining_channels));
+    }
     ESP_LOGI("wifi_blocking_mod", "Getting the length of the remaining_channels");
     int channel_count = mp_obj_get_int(mp_obj_len(mp_state_ctx.vm.remaining_channels));
     ESP_LOGI("wifi_blocking_mod", "The length value is %d", channel_count);
@@ -276,6 +284,33 @@ static void require_if(mp_obj_t wlan_if, int if_no) {
 
 void esp_initialise_wifi(void) {
     static int wifi_initialized = 0;
+    /// TODO: This is extraordinary scuffed? Like ultra not how this is supposed to work.
+    // The micropython soft reset clears all of the python VMs variables.
+    // This leads to the global references for the following variables to be pointing at uninitialized memory.
+    // This memory can and repeatedly does "appear" like a valid python object, and even a valid list sometimes.
+    // Therefore it cannot just be simply checked as far as I can tell. While the python VM has it's state cleared, 
+    // the global variables for this code are not cleared IE the variable `wifi_initalized`. Therefore, on the new
+    // running of the main loop, a wifi initialization occurs, but does nothing as the wifi_initialized is already true.
+    // This would cause creating these values inside of the if statement to break, leaving un initialized memory.
+    // This is a jank quick fix that anytime `network.WLAN()` is called, it will re-init these variables. If this method
+    // is called more than once it WILL cause some weirdness around a multi-channel scan. Specifically, it will likely cause 
+    // the scan to stop right away as there are no longer new channels to scan, clear the partially saved APs, and reset
+    // the aps seen in the last scan. I have no clue how to handle this properly at 1AM, so 🤷‍♀️.
+    // In other places there is deinit_all, that handles something around a soft reboot. I do not entirely understand what
+    // those pieces of code are doing, and how it actually makes it work correctly around having the global python objects
+    // deleted without. My best guess is that once the variables are set it turns a global flag like `wifi_initalized` to false
+    // triggering the re-creation of the variables on the next init process, where that same flag gets set to true causing
+    // further inits to not re-create those.
+    ESP_LOGE("mod_blocking", "esp_initialise_wifi was called");
+    // Create the remaining channels list
+    mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
+    ESP_LOGE("mod_blocking", "Allocated the remaining_channels as an empty list");
+    // Create a list for the partial scan
+    mp_state_ctx.vm.partial_scan_aps = mp_obj_new_list(0, NULL);
+    ESP_LOGE("mod_blocking", "Allocated the partial_scan_aps as an emtpy list");
+    // Allocate that there are no aps in the last scan
+    mp_state_ctx.vm.last_scan_aps = mp_const_none;
+    ESP_LOGE("mod_blocking", "Allocated the last_scan_aps as a None object");
     if (!wifi_initialized) {
         esp_exceptions(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, network_wlan_wifi_event_handler, NULL, NULL));
         esp_exceptions(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, network_wlan_ip_event_handler, NULL, NULL));
@@ -311,13 +346,6 @@ void esp_initialise_wifi(void) {
         ESP_LOGD("modnetwork", "Initializing WiFi");
         esp_exceptions(esp_wifi_init(&cfg));
         esp_exceptions(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-        // Create the remaining channels list
-        mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
-        // Create a list for the partial scan
-        mp_state_ctx.vm.partial_scan_aps = mp_obj_new_list(0, NULL);
-        // Allocate that there are no aps in the last scan
-        mp_state_ctx.vm.last_scan_aps = mp_const_none;
 
         ESP_LOGD("modnetwork", "Initialized");
         wifi_initialized = 1;
@@ -677,6 +705,31 @@ def garbage_loop(num_loops: int = 100, channel=0):
     cleaned = gc.mem_free()
     print("starting: " + str(starting_mem) + " ending: " + str(ending_mem) + " cleaned: " + str(cleaned))
     print("overall difference: " + str(starting_mem - cleaned) + " bytes")
+
+Loop testing
+>>> micropython.mem_info()
+stack: 704 out of 15360
+GC: total: 56000, used: 5216, free: 50784, max new split: 102400
+ No. of 1-blocks: 64, 2-blocks: 14, max blk sz: 40, max free sz: 3102
+>>> garbage_loop(num_loops=1000, channel=[1,2,3,4,5,6,7,8,9,10,11,12,13,14])
+
+
+Broke?
+
+import network.
+self.wlan.scan_non_blocking(blocking=False)
+#await uasyncio.sleep_ms(10)
+while self.wlan.in_progress():
+    await uasyncio.sleep_ms(200)
+    continue
+nets = self.wlan.results()
+
+
+import esp;
+esp.osdebug(esp.LOG_DEBUG);
+import network;
+nic = network.WLAN(network.STA_IF);
+nic.active(True);
 */
 
 static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
@@ -715,6 +768,15 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
     // Raise an error if the scan is already happening
     if (scan_in_progress) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Scan is already running, cannot start another scan"));
+    }
+
+    ESP_LOGE("wifi_blocking_mod", "checking if the remaining lists is an object in scan");
+    if(!mp_obj_is_obj(mp_state_ctx.vm.remaining_channels)){
+        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was not a real micropython object, recreating a new empty list");
+        mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
+    } else {
+        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was an object?");
+        ESP_LOGE("wifi_blocking_mod", "Type %s", mp_obj_get_type_str(mp_state_ctx.vm.remaining_channels));
     }
 
     // check that STA mode is active
