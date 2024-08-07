@@ -80,6 +80,27 @@ static bool scan_in_progress = false;
 // A list to hold the remaining channels to scan
 // static mp_obj_t remaining_channels;
 
+// An array to hold the remaining channels for a multi-channel scan
+static int *remaining_channels = NULL;
+static int remaining_channels_len = -1;
+static int remaining_channels_index = -1;
+
+typedef struct wifi_ap_scan_record_t {
+    // When gathering the results, this is a *wifi_ap_record_t, so I think we need a pointer to the pointer?
+    // This will need freed after being used
+    wifi_ap_record_t *wifi_ap_record;
+    int wifi_ap_record_count;
+    struct wifi_ap_scan_record_t* next_record;
+} wifi_ap_scan_record_t;
+
+// The singly linked list that will get used to fill out the scanned ap list after all the searches are done.
+static wifi_ap_scan_record_t *scan_head = NULL;
+static wifi_ap_scan_record_t *scan_tail = NULL;
+
+// Tell the callback function that a de-init has happened, therefore discard the results of the scan
+// Start with true, so it defaults to discarding
+static bool soft_reboot_happened = false;
+
 // // A list for the last scan results
 // static mp_obj_t last_scan_aps;
 
@@ -98,55 +119,129 @@ static uint8_t conf_wifi_sta_reconnects = 0;
 static uint8_t wifi_sta_reconnects;
 
 // Declare the function here for the scan_done_cb to work properly
-static void read_wifi_scan_results(void);
+static bool read_wifi_scan_results(void);
 
 // This callback is scheduled by the WIFI_EVENT_SCAN_DONE, so that the execution happens outside of the system thread task, and has the micro-python context.
 static mp_obj_t scan_done_cb(mp_obj_t arg){
     ESP_LOGI("wifi_blocking_mod", "Now inside of the scan_done_callback");
     // Save the new partial scan results to the list. This also frees the allocated memory from esp-idf
-    read_wifi_scan_results();
-    ESP_LOGI("wifi_blocking_mod", "Got the latest scan results");
-    // See if there are any more channels that need to be scanned
-    ESP_LOGE("wifi_blocking_mod", "checking if the remaining lists is an object");
-    if(!mp_obj_is_obj(mp_state_ctx.vm.remaining_channels)){
-        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was not a real micropython object, recreating a new empty list");
-        mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
-    } else {
-        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was an object?");
-        ESP_LOGE("wifi_blocking_mod", "Type %s", mp_obj_get_type_str(mp_state_ctx.vm.remaining_channels));
-    }
-    ESP_LOGI("wifi_blocking_mod", "Getting the length of the remaining_channels");
-    int channel_count = mp_obj_get_int(mp_obj_len(mp_state_ctx.vm.remaining_channels));
-    ESP_LOGI("wifi_blocking_mod", "The length value is %d", channel_count);
-    if (channel_count > 0){
-        ESP_LOGI("wifi_blocking_mod", "There are still channels that need scanning!");
-        // If we are here, it is safe to assume at least 1 item in the list
-        mp_obj_t *channels;
-        unsigned int channels_len;
-        ESP_LOGI("wifi_blocking_mod", "Getting the next channel from the remaining_channels list");
-        mp_obj_get_array(mp_state_ctx.vm.remaining_channels, &channels_len, &channels);
-        if (channels_len == 0){
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Something wrong here?"));
+    if(!read_wifi_scan_results()){
+        // If this returns false, then a soft reboot happened, and we need to clear out all the things
+        ESP_LOGE("wifi_blocking_mod", "This was a scan that completed after a reset");
+        while(scan_head != NULL){
+            free(scan_head->wifi_ap_record);
+            wifi_ap_scan_record_t *new_head = scan_head->next_record;
+            scan_head = new_head;
         }
-        ESP_LOGI("wifi_blocking_mod", "Setting the configuration to have channel %ld", mp_obj_get_int(channels[0]));
-        scanning_config.channel = mp_obj_get_int(channels[0]);
-        ESP_LOGI("wifi_blocking_mod", "Removing the channel from remaining_channels");
-        mp_obj_list_remove(mp_state_ctx.vm.remaining_channels, channels[0]);
+        free(remaining_channels);
+        remaining_channels_len = -1;
+        remaining_channels_index = -1;
+        scan_in_progress = false;
+        soft_reboot_happened = false;
+        mp_state_ctx.vm.last_scan_aps = mp_const_none;
+
+        ESP_LOGE("wifi_blocking_mod", "Done clearing the state from the previous scan completing, returning nothing");        
+        return mp_const_none;
+    }
+
+    if (remaining_channels_len != -1){
+        ESP_LOGI("wifi_blocking_mod", "There are more channels to scan");
+        ESP_LOGD("wifi_blocking_mod", "There appears to be %d more channels that need scanned", (remaining_channels_len - remaining_channels_index));
+        int next_channel = remaining_channels[remaining_channels_index];
+        ESP_LOGI("wifi_blocking_mod", "Pulled off the channel %d from the list at index %d, incrementing index", next_channel, remaining_channels_index);
+        // Move to the next index
+        remaining_channels_index++;
+        // If we reached the end of the list
+        if (remaining_channels_index == remaining_channels_len){
+            ESP_LOGI("wifi_blocking_mod", "Reached end of the remaining channels, clearing the array, len, and index");
+            free(remaining_channels);
+            remaining_channels = NULL;
+            remaining_channels_len = -1;
+            remaining_channels_index = -1;
+        }
+        ESP_LOGD("wifi_blocking_mod", "Setting the scanning_config to use this channel");
+        scanning_config.channel = next_channel;
         ESP_LOGI("wifi_blocking_mod", "Starting the scan on the new channel");
         MP_THREAD_GIL_EXIT();
         // Don't block even if the original was blocking because that is doing busy wait
         esp_err_t status = esp_wifi_scan_start(&scanning_config, 0);
         MP_THREAD_GIL_ENTER();
         esp_exceptions(status);
+    // If there are no more channels to scan read out the scan results into a new list and clear the set flag
     } else {
-        ESP_LOGI("wifi_blocking_mod", "There are no channels that need scanning, so we are done");
-        ESP_LOGI("wifi_blocking_mod", "Setting the last_scan_aps to the partial_scan_aps");
-        mp_state_ctx.vm.last_scan_aps = mp_state_ctx.vm.partial_scan_aps;
-        ESP_LOGI("wifi_blocking_mod", "Clearing the scan_in_progress flag");
+        // Allocate a whole new list
+        mp_obj_t list = mp_obj_new_list(0, NULL);
+        // Go through the whole results list, parsing the results into a 
+        while(scan_head != NULL){
+            ESP_LOGI("wifi_blocking_mod", "Starting loading a new set of ap records into a new list");
+            for (uint16_t i = 0; i < scan_head->wifi_ap_record_count; i++){
+                mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
+                uint8_t *x = memchr(scan_head->wifi_ap_record[i].ssid, 0, sizeof(scan_head->wifi_ap_record[i].ssid));
+                int ssid_len = x ? x - scan_head->wifi_ap_record[i].ssid : sizeof(scan_head->wifi_ap_record[i].ssid);
+                t->items[0] = mp_obj_new_bytes(scan_head->wifi_ap_record[i].ssid, ssid_len);
+                t->items[1] = mp_obj_new_bytes(scan_head->wifi_ap_record[i].bssid, sizeof(scan_head->wifi_ap_record[i].bssid));
+                t->items[2] = MP_OBJ_NEW_SMALL_INT(scan_head->wifi_ap_record[i].primary);
+                t->items[3] = MP_OBJ_NEW_SMALL_INT(scan_head->wifi_ap_record[i].rssi);
+                t->items[4] = MP_OBJ_NEW_SMALL_INT(scan_head->wifi_ap_record[i].authmode);
+                /// TODO: Get the hidden value correctly
+                t->items[5] = mp_const_false; // XXX hidden?
+                mp_obj_list_append(list, MP_OBJ_FROM_PTR(t));
+            }
+            // Free the record memory
+            ESP_LOGI("wifi_blocking_mod", "Freeing the allocated space for the head of the scan_list");
+            free(scan_head->wifi_ap_record);
+            ESP_LOGI("wifi_blocking_mod", "Getting the next item in the list, and freeing the record");
+            wifi_ap_scan_record_t *new_head = scan_head->next_record;
+            free(scan_head);
+            scan_head = new_head;
+        }
+        ESP_LOGI("wifi_blocking_mod", "All the records were read into the list, setting global and clearing flag");
+        mp_state_ctx.vm.last_scan_aps = list;
         scan_in_progress = false;
-        // TODO: If there was a callback, and this was a background scan, make the call to the callback function
     }
     return mp_const_none;
+    // ESP_LOGI("wifi_blocking_mod", "Got the latest scan results");
+    // See if there are any more channels that need to be scanned
+    // ESP_LOGE("wifi_blocking_mod", "checking if the remaining lists is an object");
+    // if(!mp_obj_is_obj(mp_state_ctx.vm.remaining_channels)){
+    //     ESP_LOGE("wifi_blocking_mod", "The remaining_channels was not a real micropython object, recreating a new empty list");
+    //     mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
+    // } else {
+    //     ESP_LOGE("wifi_blocking_mod", "The remaining_channels was an object?");
+    //     ESP_LOGE("wifi_blocking_mod", "Type %s", mp_obj_get_type_str(mp_state_ctx.vm.remaining_channels));
+    // }
+    // ESP_LOGI("wifi_blocking_mod", "Getting the length of the remaining_channels");
+    // int channel_count = mp_obj_get_int(mp_obj_len(mp_state_ctx.vm.remaining_channels));
+    // ESP_LOGI("wifi_blocking_mod", "The length value is %d", channel_count);
+    // if (channel_count > 0){
+    //     ESP_LOGI("wifi_blocking_mod", "There are still channels that need scanning!");
+    //     // If we are here, it is safe to assume at least 1 item in the list
+    //     mp_obj_t *channels;
+    //     unsigned int channels_len;
+    //     ESP_LOGI("wifi_blocking_mod", "Getting the next channel from the remaining_channels list");
+    //     mp_obj_get_array(mp_state_ctx.vm.remaining_channels, &channels_len, &channels);
+    //     if (channels_len == 0){
+    // //         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Something wrong here?"));
+    // //     }
+    //     ESP_LOGI("wifi_blocking_mod", "Setting the configuration to have channel %ld", mp_obj_get_int(channels[0]));
+    //     scanning_config.channel = mp_obj_get_int(channels[0]);
+    //     ESP_LOGI("wifi_blocking_mod", "Removing the channel from remaining_channels");
+    //     mp_obj_list_remove(mp_state_ctx.vm.remaining_channels, channels[0]);
+    //     ESP_LOGI("wifi_blocking_mod", "Starting the scan on the new channel");
+    //     MP_THREAD_GIL_EXIT();
+    //     // Don't block even if the original was blocking because that is doing busy wait
+    //     esp_err_t status = esp_wifi_scan_start(&scanning_config, 0);
+    //     MP_THREAD_GIL_ENTER();
+    // //     esp_exceptions(status);
+    // } else {
+    //     ESP_LOGI("wifi_blocking_mod", "There are no channels that need scanning, so we are done");
+    //     ESP_LOGI("wifi_blocking_mod", "Setting the last_scan_aps to the partial_scan_aps");
+    //     mp_state_ctx.vm.last_scan_aps = mp_state_ctx.vm.partial_scan_aps;
+    //     ESP_LOGI("wifi_blocking_mod", "Clearing the scan_in_progress flag");
+    //     scan_in_progress = false;
+    //     // TODO: If there was a callback, and this was a background scan, make the call to the callback function
+    // }
+    // return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(network_wlan_scan_done_cb_obj, scan_done_cb);
 
@@ -240,6 +335,19 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
             wlan_ap_obj.active = false;
             break;
 
+
+        /* TODO:
+           |-> Right now, if there is a soft reboot while a scan is actively happening
+              |-> This WIFI_EVENT_SCAN_DONE callback is still the callback in the eyes of esp-idf causing it to execute
+                |-> This results in network_wlan_scan_done_cb to be called, which will then try to read these items and put them in the partial_scan_aps list that no longer exists
+                    |-> This causes a crash when it makes an attempt to access un-initialized memory.
+
+            |-> The reading of the results on this callback MUST happen. If it does not, then the results will get stuck in the esp-idf heap hogging the memory
+               |-> The deinit process can set a flag if a scan is actively still in progress
+                  |-> This flag causes the callback to still read the results properly and then just completely discards the results because we don't care
+                  |-> I have no clue who should be clearing this flag. After getting the first result, is it safe to assume a new scan won't happen until a new init has happened?
+                    |-> Or should the init process clear the flag, thus causing all of the scans done before a new init to discard the results?
+        */
         case WIFI_EVENT_SCAN_DONE:
             // When a scan is done, schedule the callback function to handle the rest of the work since it needs to be done in the micro python context
             // instead of the system event context.
@@ -301,14 +409,22 @@ void esp_initialise_wifi(void) {
     // deleted without. My best guess is that once the variables are set it turns a global flag like `wifi_initalized` to false
     // triggering the re-creation of the variables on the next init process, where that same flag gets set to true causing
     // further inits to not re-create those.
-    ESP_LOGE("mod_blocking", "esp_initialise_wifi was called");
-    // Create the remaining channels list
-    mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
-    ESP_LOGE("mod_blocking", "Allocated the remaining_channels as an empty list");
-    // Create a list for the partial scan
-    mp_state_ctx.vm.partial_scan_aps = mp_obj_new_list(0, NULL);
-    ESP_LOGE("mod_blocking", "Allocated the partial_scan_aps as an emtpy list");
+    //      Is a proper fix for this, changing the code to use C arrays, and/or linked lists? IE the remaining channels
+    //          becomes an array of the channels required, a length variable, and the index in the array. This shouldn't
+    //          cause the value to be cleared on soft reboot. This partial_scan_aps would likely need to become a linked list
+    //          where you store each wifi value in a newly malloc'd value since large blocks storing all of the results at 
+    //          once for each of the up to 14 scans could results in allocation issues.
+    //          last_aps_seen could probably still be a normal python list that is created, and has tuples appended after all
+    //          the scan results are completed, which clears each of the items in the linked list as it empties them.
+    // ESP_LOGE("mod_blocking", "esp_initialise_wifi was called");
+    // // Create the remaining channels list
+    // mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
+    // ESP_LOGE("mod_blocking", "Allocated the remaining_channels as an empty list");
+    // // Create a list for the partial scan
+    // mp_state_ctx.vm.partial_scan_aps = mp_obj_new_list(0, NULL);
+    // ESP_LOGE("mod_blocking", "Allocated the partial_scan_aps as an emtpy list");
     // Allocate that there are no aps in the last scan
+    /// TODO: I don't like this always clearing. IE if you did a scan, and ran network.WLAN() it will cause it to be reset to None when it shouldn't need to be.
     mp_state_ctx.vm.last_scan_aps = mp_const_none;
     ESP_LOGE("mod_blocking", "Allocated the last_scan_aps as a None object");
     if (!wifi_initialized) {
@@ -544,7 +660,6 @@ static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
 
     mp_obj_t list = mp_obj_new_list(0, NULL);
     wifi_scan_config_t config = { 0 };
-    config.show_hidden = true;
     MP_THREAD_GIL_EXIT();
     esp_err_t status = esp_wifi_scan_start(&config, 1);
     MP_THREAD_GIL_ENTER();
@@ -577,11 +692,10 @@ static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(network_wlan_scan_obj, network_wlan_scan);
 
-// This is a helper function that handles saving the wifi scan results into the partial scan buffer
-static void read_wifi_scan_results(){
-    // TODO: Check if the partial_scan_aps exists
-    // Create a new list to store the networks
-    ESP_LOGI("wifi_blocking_mod", "Getting the number of aps to account for");
+// This will read the partial_scan_results and return true if the results were saved in the list
+static bool read_wifi_scan_results(){
+    ESP_LOGD("wifi_blocking_mod", "Reading the wifi scan's results");
+    ESP_LOGD("wifi_blocking_mod", "Getting the number of aps to account for");
     uint16_t count = 0;
     esp_exceptions(esp_wifi_scan_get_ap_num(&count));
     if (count == 0) {
@@ -590,33 +704,72 @@ static void read_wifi_scan_results(){
         // esp_wifi_scan_get_ap_records will then return the actual number of APs in count.
         count = 1;
     }
-    ESP_LOGI("wifi_blocking_mod", "Allocating the space for %d aps", count);
+    ESP_LOGD("wifi_blocking_mod", "Allocating the space for %d aps", count);
     wifi_ap_record_t *wifi_ap_records = calloc(count, sizeof(wifi_ap_record_t));
-    ESP_LOGI("wifi_blocking_mod", "Getting the records for the aps");
+    ESP_LOGD("wifi_blocking_mod", "Getting the records for the aps");
     esp_exceptions(esp_wifi_scan_get_ap_records(&count, wifi_ap_records));
-    ESP_LOGI("wifi_blocking_mod", "Starting iterations");
-    for (uint16_t i = 0; i < count; i++) {
-        // Uncomment all these lines for more verbose of what is going on in here
-        // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying tuple creation", i);
-        mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
-        // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying memchr", i);
-        uint8_t *x = memchr(wifi_ap_records[i].ssid, 0, sizeof(wifi_ap_records[i].ssid));
-        int ssid_len = x ? x - wifi_ap_records[i].ssid : sizeof(wifi_ap_records[i].ssid);
-        // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying ssid_len", i);
-        t->items[0] = mp_obj_new_bytes(wifi_ap_records[i].ssid, ssid_len);
-        // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying bssid", i);
-        t->items[1] = mp_obj_new_bytes(wifi_ap_records[i].bssid, sizeof(wifi_ap_records[i].bssid));
-        t->items[2] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].primary);
-        // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying primary", i);
-        t->items[3] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].rssi);
-        // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying authmod", i);
-        t->items[4] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].authmode);
-        t->items[5] = mp_const_false; // XXX hidden?
-        // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying append", i);
-        mp_obj_list_append(mp_state_ctx.vm.partial_scan_aps, MP_OBJ_FROM_PTR(t));
+    // If there was a soft_reboot before the last init, then discard the results with no return
+    if(soft_reboot_happened){
+        ESP_LOGD("wifi_blocking_mod", "There has been a soft reboot since the scan started, discarding results");
+        free(wifi_ap_records);
+        return false;
     }
-    ESP_LOGI("wifi_blocking_mod", "freed the records");
-    free(wifi_ap_records);
+    // Otherwise create a new record item
+    wifi_ap_scan_record_t *new_record = calloc(1, sizeof(wifi_ap_scan_record_t));
+    // Set the array pointer and the next_record
+    new_record->wifi_ap_record = wifi_ap_records;
+    new_record->wifi_ap_record_count = count;
+    new_record->next_record = NULL;
+    // If there is no list yet start it
+    if(scan_head == NULL){
+        scan_head = new_record;
+        scan_tail = new_record;
+    // The list is already started
+    } else {
+        // Then update the current tail's next, and update the tail
+        scan_tail->next_record = new_record;
+        scan_tail = new_record;
+    }
+    return true;
+
+    // // TODO: Check if the partial_scan_aps exists
+    // // Create a new list to store the networks
+    // ESP_LOGI("wifi_blocking_mod", "Getting the number of aps to account for");
+    // uint16_t count = 0;
+    // esp_exceptions(esp_wifi_scan_get_ap_num(&count));
+    // if (count == 0) {
+    //     // esp_wifi_scan_get_ap_records must be called to free internal buffers from the scan.
+    //     // But it returns an error if wifi_ap_records==NULL.  So allocate at least 1 AP entry.
+    //     // esp_wifi_scan_get_ap_records will then return the actual number of APs in count.
+    //     count = 1;
+    // }
+    // ESP_LOGI("wifi_blocking_mod", "Allocating the space for %d aps", count);
+    // wifi_ap_record_t *wifi_ap_records = calloc(count, sizeof(wifi_ap_record_t));
+    // ESP_LOGI("wifi_blocking_mod", "Getting the records for the aps");
+    // esp_exceptions(esp_wifi_scan_get_ap_records(&count, wifi_ap_records));
+    // ESP_LOGI("wifi_blocking_mod", "Starting iterations");
+    // for (uint16_t i = 0; i < count; i++) {
+    //     // Uncomment all these lines for more verbose of what is going on in here
+    //     // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying tuple creation", i);
+    //     mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
+    //     // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying memchr", i);
+    //     uint8_t *x = memchr(wifi_ap_records[i].ssid, 0, sizeof(wifi_ap_records[i].ssid));
+    //     int ssid_len = x ? x - wifi_ap_records[i].ssid : sizeof(wifi_ap_records[i].ssid);
+    //     // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying ssid_len", i);
+    //     t->items[0] = mp_obj_new_bytes(wifi_ap_records[i].ssid, ssid_len);
+    //     // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying bssid", i);
+    //     t->items[1] = mp_obj_new_bytes(wifi_ap_records[i].bssid, sizeof(wifi_ap_records[i].bssid));
+    //     t->items[2] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].primary);
+    //     // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying primary", i);
+    //     t->items[3] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].rssi);
+    //     // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying authmod", i);
+    //     t->items[4] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].authmode);
+    //     t->items[5] = mp_const_false; // XXX hidden?
+    //     // ESP_LOGE("wifi_blocking_mod", "Iteration %d trying append", i);
+    //     mp_obj_list_append(mp_state_ctx.vm.partial_scan_aps, MP_OBJ_FROM_PTR(t));
+    // }
+    // ESP_LOGI("wifi_blocking_mod", "freed the records");
+    // free(wifi_ap_records);
 }
 
 // Get the last results and return them.
@@ -638,11 +791,20 @@ static mp_obj_t network_wlan_in_progress(mp_obj_t self_in){
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(network_wlan_in_progress_obj, network_wlan_in_progress);
 
+// This is called from the Ctrl-D soft reboot
+void network_wlan_deinit_all(void){
+    if(scan_in_progress){
+        ESP_LOGI("wifi_blocking_mod", "soft reboot is happening, while a scan is going on, setting the flag to ignore scan callback");
+        soft_reboot_happened = true;
+    }
+}
+
 /* Some basic test python code
 # This will setup the networking, and also enable the verbose debug logging
 import esp; esp.osdebug(esp.LOG_VERBOSE); import network; nic = network.WLAN(network.STA_IF); nic.active(True);
 
 import esp; esp.osdebug(esp.LOG_INFO); import network; nic = network.WLAN(network.STA_IF); nic.active(True);
+import esp; esp.osdebug(esp.LOG_DEBUG); import network; nic = network.WLAN(network.STA_IF); nic.active(True);
 
 
 # Without verbose logging
@@ -653,6 +815,8 @@ nic.scan_non_blocking(channel=3)
 
 # Multi channel scan
 nic.scan_non_blocking(channel=[2, 3, 9])
+
+nic.scan_non_blocking(channel=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]])
 
 # Large min scan time, and print the progress state when done to show it's blocking
 nic.scan_non_blocking(channel=3, scan_time_active_min=2000, scan_time_active_max=4000); print(nic.in_progress())
@@ -690,6 +854,9 @@ def garbage_check():
     print("starting: " + str(starting_mem) + " ending: " + str(ending_mem) + " cleaned: " + str(cleaned))
     print("overall difference: " + str(starting_mem - cleaned) + " bytes")
 
+import esp; esp.osdebug(esp.LOG_INFO); 
+
+import network; nic = network.WLAN(network.STA_IF); nic.active(True);
 # Do it in a loop to try for a memory leak to show up
 def garbage_loop(num_loops: int = 100, channel=0):
     import gc
@@ -733,6 +900,10 @@ nic.active(True);
 */
 
 static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_blocking, ARG_channel, ARG_ssid, ARG_bssid, ARG_show_hidden, ARG_active_scan,
+           ARG_scan_time_passive, ARG_scan_time_active_min, ARG_scan_time_active_max, 
+           ARG_home_chan_dwell_time, ARG_callback
+        };
     static const mp_arg_t allowed_args[] = {
         // Create the list of optional elements that can be given, starting with the self object that
         // will always exist 
@@ -744,6 +915,7 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
         // The ssid string that should be scanned for, default of None
         { MP_QSTR_ssid, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_none }},
         // The mac address bssid that should be scanned for, default is None
+        /// TODO: Should this be allowed as bytes, a string or both?
         { MP_QSTR_bssid, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_none }},
         // If hidden networks should be shown, default of false
         { MP_QSTR_show_hidden, MP_ARG_KW_ONLY | MP_ARG_BOOL, { .u_bool = false }},
@@ -770,14 +942,14 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Scan is already running, cannot start another scan"));
     }
 
-    ESP_LOGE("wifi_blocking_mod", "checking if the remaining lists is an object in scan");
-    if(!mp_obj_is_obj(mp_state_ctx.vm.remaining_channels)){
-        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was not a real micropython object, recreating a new empty list");
-        mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
-    } else {
-        ESP_LOGE("wifi_blocking_mod", "The remaining_channels was an object?");
-        ESP_LOGE("wifi_blocking_mod", "Type %s", mp_obj_get_type_str(mp_state_ctx.vm.remaining_channels));
-    }
+    // ESP_LOGE("wifi_blocking_mod", "checking if the remaining lists is an object in scan");
+    // if(!mp_obj_is_obj(mp_state_ctx.vm.remaining_channels)){
+    //     ESP_LOGE("wifi_blocking_mod", "The remaining_channels was not a real micropython object, recreating a new empty list");
+    //     mp_state_ctx.vm.remaining_channels = mp_obj_new_list(0, NULL);
+    // } else {
+    //     ESP_LOGE("wifi_blocking_mod", "The remaining_channels was an object?");
+    //     ESP_LOGE("wifi_blocking_mod", "Type %s", mp_obj_get_type_str(mp_state_ctx.vm.remaining_channels));
+    // }
 
     // check that STA mode is active
     wifi_mode_t mode;
@@ -795,12 +967,12 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
     bool scan_list = false;
 
     /// TODO: Check that blocking is valid. I don't think it should ever not be with MP_ARG_BOOL, but unsure
-    blocking = args[1].u_bool;
+    blocking = args[ARG_blocking].u_bool;
 
     // Check that the channels are properly typed
     // If the object is an integer, then it's a single channel scan
-    if (mp_obj_is_int(args[2].u_obj)){
-        int chan = mp_obj_get_int(args[2].u_obj);
+    if (mp_obj_is_int(args[ARG_channel].u_obj)){
+        int chan = mp_obj_get_int(args[ARG_channel].u_obj);
         ESP_LOGD("wifi_blocking_mod", "Got a single channel %d", chan);
         if (chan > 14 || chan < 0){
             mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Bad channel value, expecting 1-14"));
@@ -808,9 +980,9 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
         scan_channel = chan;
         /// TODO: Should this force the remaining_channels list to 0 items?
     // Check if the object is a list or tuple
-    } else if (mp_obj_is_type(args[2].u_obj, &mp_type_list) || mp_obj_is_type(args[2].u_obj, &mp_type_tuple)){
+    } else if (mp_obj_is_type(args[ARG_channel].u_obj, &mp_type_list) || mp_obj_is_type(args[ARG_channel].u_obj, &mp_type_tuple)){
         ESP_LOGI("wifi_blocking_mod", "Got a list of channels to scan");
-        mp_obj_t channel_list = args[2].u_obj;
+        mp_obj_t channel_list = args[ARG_channel].u_obj;
         int channel_count = mp_obj_get_int(mp_obj_len(channel_list));
         // Check if there are more channels than possible
         if (channel_count > 14) {
@@ -834,24 +1006,34 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
             if (temp_channel_number > 14 || temp_channel_number < 1){
                 mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Unsupported channel values in channel list"));
             }
-            // TODO: Check for duplicate channels
+            /// TODO: Check for duplicate channels
         }
         // Set the scan_list flag
         scan_list = true;
         // Set the channel to start this scan on
         scan_channel = mp_obj_get_int(items[0]);
-        // Create a new list to use for the channels that need scanned
-        // mp_obj_t list = mp_obj_new_list(0, NULL);
+        ESP_LOGD("wifi_blocking_mod", "Allocating space for the remaining channels");
+        // Allocate an array for the channels that remain to be scanned
+        int* new_channels = calloc(channel_count-1, sizeof(int));
         // Start the indexing at 1 since the first channel will be started in this method
         for(int i = 1; i < channel_count; i++){
-            ESP_LOGI("wifi_blocking_mod", "Adding channel %ld to the list of channels to scan", mp_obj_get_int(items[i]));
+            int channel = mp_obj_get_int(items[i]);
+            ESP_LOGI("wifi_blocking_mod", "Adding channel %d to the list of channels to scan", channel);
             // Append the channel to the list
-            mp_obj_list_append(mp_state_ctx.vm.remaining_channels, items[i]);
+            new_channels[i-1] = channel;
         }
+        if(remaining_channels != NULL){
+            ESP_LOGE("wifi_blocking_mod", "There was another attempt to replace the remaining_channels array while it wasn't NULL");
+        }
+        ESP_LOGD("wifi_blocking_mod", "Setting the remaining_channels array");
+        // Set the remaining_channels array and length and index
+        remaining_channels = new_channels;
+        remaining_channels_len = channel_count - 1;
+        remaining_channels_index = 0;
         // // Set the remaining channel list to have these saved
         // remaining_channels = list;
     // If there was nothing given assume 0 for scan all
-    } else if (args[2].u_obj == mp_const_none) {
+    } else if (args[ARG_channel].u_obj == mp_const_none) {
         ESP_LOGI("wifi_blocking_mod", "No channels given, scanning all of them");
     } else {
         mp_raise_msg(&mp_type_TypeError, MP_ERROR_TEXT("Channel was invalidly typed"));
@@ -859,7 +1041,7 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
 
     // Check if the ssid exists
     /// TODO: Check that the ssid is valid name for a network
-    if (!(args[3].u_obj == mp_const_none) && !mp_obj_is_str(args[3].u_obj)){
+    if (!(args[ARG_ssid].u_obj == mp_const_none) && !mp_obj_is_str(args[ARG_ssid].u_obj)){
         mp_raise_msg(&mp_type_TypeError, MP_ERROR_TEXT("Bad typing on ssid, expected a string"));
     } else {
         ESP_LOGI("wifi_blocking_mod", "There was no ssid");
@@ -867,7 +1049,7 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
 
     // Check if the bssid exists
     /// TODO: Check that the bssid is a valid mac address
-    if (!(args[4].u_obj == mp_const_none) && !(mp_obj_is_type(args[4].u_obj, &mp_type_bytes))){
+    if (!(args[ARG_bssid].u_obj == mp_const_none) && !(mp_obj_is_type(args[ARG_bssid].u_obj, &mp_type_bytes))){
         mp_raise_msg(&mp_type_TypeError, MP_ERROR_TEXT("Bad typing on bssid, expected a string"));
     } else {
         ESP_LOGI("wifi_blocking_mod", "There was no bssid");
@@ -884,12 +1066,12 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
     /// TODO: Implement having a python callback like this pull request https://github.com/micropython/micropython/pull/7526/files
 
     // Check if we should blocking, and that a callback exists
-    if (args[11].u_obj == mp_const_none && args[1].u_bool) {
+    if (args[ARG_callback].u_obj == mp_const_none && args[ARG_blocking].u_bool) {
         ESP_LOGI("wifi_blocking_mod", "Blocking is true, but there is no callback specified");
     // If there is a callback, but the scan wasn't for the blocking raise an error    
-    } else if (args[11].u_obj != mp_const_none && !args[1].u_bool) {
+    } else if (args[ARG_callback].u_obj != mp_const_none && !args[ARG_blocking].u_bool) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("The callback should only be set if a blocking scan is happening"));
-    } else if (args[11].u_obj != mp_const_none && mp_obj_is_callable(args[11].u_obj)){
+    } else if (args[ARG_callback].u_obj != mp_const_none && mp_obj_is_callable(args[ARG_callback].u_obj)){
         ESP_LOGI("wifi_blocking_mod", "There is a callback for the blocking scan");
     }
 
@@ -916,21 +1098,21 @@ static mp_obj_t network_wlan_non_blocking_scan(size_t n_args, const mp_obj_t *po
     
     ESP_LOGI("wifi_blocking_mod", "Setting the config channel to %d", scan_channel);
     scanning_config.channel = scan_channel;
-    ESP_LOGI("wifi_blocking_mod", "Setting the config show_hidden to %d", args[5].u_bool);
-    scanning_config.show_hidden = args[5].u_bool;
-    if (args[6].u_bool){
+    ESP_LOGI("wifi_blocking_mod", "Setting the config show_hidden to %d", args[ARG_show_hidden].u_bool);
+    scanning_config.show_hidden = args[ARG_show_hidden].u_bool;
+    if (args[ARG_active_scan].u_bool){
         ESP_LOGD("wifi_blocking_mod", "We are using an active type scan!");
         scanning_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
     } else {
         ESP_LOGI("wifi_blocking_mod", "We are not using an active scan type");
         scanning_config.scan_type = WIFI_SCAN_TYPE_PASSIVE;
     }
-    ESP_LOGI("wifi_blocking_mod", "Setting the config active max to %ld", args[9].u_int);
-    scanning_config.scan_time.active.max = args[9].u_int;
-    ESP_LOGI("wifi_blocking_mod", "Setting the config active min to %ld", args[8].u_int);
-    scanning_config.scan_time.active.min = args[8].u_int;
-    ESP_LOGI("wifi_blocking_mod", "Setting the config passive time to %ld", args[7].u_int);
-    scanning_config.scan_time.passive = args[7].u_int;
+    ESP_LOGI("wifi_blocking_mod", "Setting the config active max to %ld", args[ARG_scan_time_active_max].u_int);
+    scanning_config.scan_time.active.max = args[ARG_scan_time_active_max].u_int;
+    ESP_LOGI("wifi_blocking_mod", "Setting the config active min to %ld", args[ARG_scan_time_active_min].u_int);
+    scanning_config.scan_time.active.min = args[ARG_scan_time_active_min].u_int;
+    ESP_LOGI("wifi_blocking_mod", "Setting the config passive time to %ld", args[ARG_scan_time_passive].u_int);
+    scanning_config.scan_time.passive = args[ARG_scan_time_passive].u_int;
     
     ESP_LOGI("wifi_blocking_mod", "Replacing the current partial_scan_aps with an empty list");
     mp_state_ctx.vm.partial_scan_aps = mp_obj_new_list(0, NULL);
