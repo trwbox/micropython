@@ -1,0 +1,25 @@
+{
+    "deploy": [
+        "deploy.md"
+    ],
+    "docs": "",
+    "features": [
+        "Breadboard Friendly",
+        "RGB LED",
+        "Dual-core",
+        "External Flash",
+        "USB-C"
+    ],
+    "images": [
+        "4900-12.jpg"
+    ],
+    "mcu": "rp2040",
+    "product": "YD-RP2040",
+    "thumbnail": "",
+    "url": "N/A",
+    "vendor": "VCC-GND",
+    "variants": {
+        "FLASH_4M": "4 MiB Flash",
+        "FLASH_8M": "8 MiB Flash"
+    }
+}
