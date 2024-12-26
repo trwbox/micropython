@@ -29,9 +29,11 @@ typedef unsigned int mp_uint_t;     // must be pointer size
 #define MICROPY_HW_ENABLE_TIMER     (1)
 #define MICROPY_HW_ENABLE_SDCARD    (0)
 #define MICROPY_HW_ENABLE_MMCARD    (0)
+#define MICROPY_HW_ENTER_BOOTLOADER_VIA_RESET   (0)
 
 // Flash storage config
 #define MICROPY_HW_SPIFLASH_ENABLE_CACHE            (1)
+#define MICROPY_HW_SPIFLASH_SOFT_RESET              (1)
 #define MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE    (0)
 
 #define MICROPY_BOARD_STARTUP       NICLAV_board_startup
@@ -49,8 +51,8 @@ void NICLAV_board_low_power(int mode);
 #define MICROPY_BOARD_ENTER_STANDBY NICLAV_board_low_power(2);
 
 void NICLAV_board_osc_enable(int enable);
-#define MICROPY_BOARD_OSC_ENABLE    NICLAV_board_osc_enable(1);
-#define MICROPY_BOARD_OSC_DISABLE   NICLAV_board_osc_enable(0);
+#define MICROPY_BOARD_PRE_STOP      NICLAV_board_osc_enable(0);
+#define MICROPY_BOARD_POST_STOP     NICLAV_board_osc_enable(1);
 
 // PLL1 400MHz/50MHz for SDMMC and FDCAN
 // USB and RNG are clocked from the HSI48

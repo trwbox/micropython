@@ -53,6 +53,10 @@
 #else
 #include "mbedtls/version.h"
 #endif
+#if MICROPY_PY_SSL_ECDSA_SIGN_ALT
+#include "mbedtls/ecdsa.h"
+#include "mbedtls/asn1.h"
+#endif
 
 #define MP_STREAM_POLL_RDWR (MP_STREAM_POLL_RD | MP_STREAM_POLL_WR)
 
@@ -68,6 +72,9 @@ typedef struct _mp_obj_ssl_context_t {
     int authmode;
     int *ciphersuites;
     mp_obj_t handler;
+    #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
+    mp_obj_t ecdsa_sign_callback;
+    #endif
 } mp_obj_ssl_context_t;
 
 // This corresponds to an SSLSocket object.
@@ -100,11 +107,22 @@ static void mbedtls_debug(void *ctx, int level, const char *file, int line, cons
 }
 #endif
 
-#if defined(MBEDTLS_PEM_PARSE_C)
-static int mbedtls_is_pem(const byte *data, size_t len) {
-    return (len >= 10) && (strstr((const char *)data, "-----BEGIN") != NULL);
+// Given a string-like object holding PEM or DER formatted ASN.1 data, return a
+// pointer to its buffer and the correct length for mbedTLS APIs.
+//
+// (mbedTLS >= 3.5 rejects DER formatted data with trailing bytes within keylen,
+// but PEM must include a terminating NUL byte in the keylen...)
+static const unsigned char *asn1_get_data(mp_obj_t obj, size_t *out_len) {
+    size_t len;
+    const char *str = mp_obj_str_get_data(obj, &len);
+    #if defined(MBEDTLS_PEM_PARSE_C)
+    if (strstr(str, "-----BEGIN ") != NULL) {
+        ++len;
+    }
+    #endif
+    *out_len = len;
+    return (const unsigned char *)str;
 }
-#endif
 
 static NORETURN void mbedtls_raise_error(int err) {
     // Handle special cases.
@@ -152,6 +170,13 @@ static NORETURN void mbedtls_raise_error(int err) {
     #else
     // mbedtls is compiled without error strings so we simply return the err number
     mp_raise_OSError(err); // err is typically a large negative number
+    #endif
+}
+
+// Stores the current SSLContext for use in mbedtls callbacks where the current state is not passed.
+static inline void store_active_context(mp_obj_ssl_context_t *ssl_context) {
+    #if MICROPY_PY_SSL_MBEDTLS_NEED_ACTIVE_CONTEXT
+    MP_STATE_THREAD(tls_ssl_context) = ssl_context;
     #endif
 }
 
@@ -230,6 +255,9 @@ static mp_obj_t ssl_context_make_new(const mp_obj_type_t *type_in, size_t n_args
     mbedtls_pk_init(&self->pkey);
     self->ciphersuites = NULL;
     self->handler = mp_const_none;
+    #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
+    self->ecdsa_sign_callback = mp_const_none;
+    #endif
 
     #ifdef MBEDTLS_DEBUG_C
     // Debug level (0-4) 1=warning, 2=info, 3=debug, 4=verbose
@@ -277,6 +305,10 @@ static void ssl_context_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
             dest[0] = MP_OBJ_NEW_SMALL_INT(self->authmode);
         } else if (attr == MP_QSTR_verify_callback) {
             dest[0] = self->handler;
+        #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
+        } else if (attr == MP_QSTR_ecdsa_sign_callback) {
+            dest[0] = self->ecdsa_sign_callback;
+        #endif
         } else {
             // Continue lookup in locals_dict.
             dest[1] = MP_OBJ_SENTINEL;
@@ -287,6 +319,11 @@ static void ssl_context_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
             self->authmode = mp_obj_get_int(dest[1]);
             dest[0] = MP_OBJ_NULL;
             mbedtls_ssl_conf_authmode(&self->conf, self->authmode);
+        #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
+        } else if (attr == MP_QSTR_ecdsa_sign_callback) {
+            dest[0] = MP_OBJ_NULL;
+            self->ecdsa_sign_callback = dest[1];
+        #endif
         } else if (attr == MP_QSTR_verify_callback) {
             dest[0] = MP_OBJ_NULL;
             self->handler = dest[1];
@@ -352,15 +389,7 @@ static MP_DEFINE_CONST_FUN_OBJ_2(ssl_context_set_ciphers_obj, ssl_context_set_ci
 
 static void ssl_context_load_key(mp_obj_ssl_context_t *self, mp_obj_t key_obj, mp_obj_t cert_obj) {
     size_t key_len;
-    const byte *key = (const byte *)mp_obj_str_get_data(key_obj, &key_len);
-
-    #if defined(MBEDTLS_PEM_PARSE_C)
-    // len should include terminating null if the data is PEM encoded
-    if (mbedtls_is_pem(key, key_len)) {
-        key_len += 1;
-    }
-    #endif
-
+    const unsigned char *key = asn1_get_data(key_obj, &key_len);
     int ret;
     #if MBEDTLS_VERSION_NUMBER >= 0x03000000
     ret = mbedtls_pk_parse_key(&self->pkey, key, key_len, NULL, 0, mbedtls_ctr_drbg_random, &self->ctr_drbg);
@@ -372,15 +401,7 @@ static void ssl_context_load_key(mp_obj_ssl_context_t *self, mp_obj_t key_obj, m
     }
 
     size_t cert_len;
-    const byte *cert = (const byte *)mp_obj_str_get_data(cert_obj, &cert_len);
-
-    #if defined(MBEDTLS_PEM_PARSE_C)
-    // len should include terminating null if the data is PEM encoded
-    if (mbedtls_is_pem(cert, cert_len)) {
-        cert_len += 1;
-    }
-    #endif
-
+    const unsigned char *cert = asn1_get_data(cert_obj, &cert_len);
     ret = mbedtls_x509_crt_parse(&self->cert, cert, cert_len);
     if (ret != 0) {
         mbedtls_raise_error(MBEDTLS_ERR_X509_BAD_INPUT_DATA); // use general error for all cert errors
@@ -402,15 +423,7 @@ static MP_DEFINE_CONST_FUN_OBJ_3(ssl_context_load_cert_chain_obj, ssl_context_lo
 
 static void ssl_context_load_cadata(mp_obj_ssl_context_t *self, mp_obj_t cadata_obj) {
     size_t cacert_len;
-    const byte *cacert = (const byte *)mp_obj_str_get_data(cadata_obj, &cacert_len);
-
-    #if defined(MBEDTLS_PEM_PARSE_C)
-    // len should include terminating null if the data is PEM encoded
-    if (mbedtls_is_pem(cacert, cacert_len)) {
-        cacert_len += 1;
-    }
-    #endif
-
+    const unsigned char *cacert = asn1_get_data(cadata_obj, &cacert_len);
     int ret = mbedtls_x509_crt_parse(&self->cacert, cacert, cacert_len);
     if (ret != 0) {
         mbedtls_raise_error(MBEDTLS_ERR_X509_BAD_INPUT_DATA); // use general error for all cert errors
@@ -509,6 +522,9 @@ static int _mbedtls_ssl_recv(void *ctx, byte *buf, size_t len) {
 
 static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t sock,
     bool server_side, bool do_handshake_on_connect, mp_obj_t server_hostname) {
+
+    // Store the current SSL context.
+    store_active_context(ssl_context);
 
     // Verify the socket object has the full stream protocol
     mp_get_stream_raise(sock, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE | MP_STREAM_OP_IOCTL);
@@ -615,6 +631,9 @@ static mp_uint_t socket_read(mp_obj_t o_in, void *buf, mp_uint_t size, int *errc
         return MP_STREAM_ERROR;
     }
 
+    // Store the current SSL context.
+    store_active_context(o->ssl_context);
+
     int ret = mbedtls_ssl_read(&o->ssl, buf, size);
     if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
         // end of stream
@@ -656,6 +675,9 @@ static mp_uint_t socket_write(mp_obj_t o_in, const void *buf, mp_uint_t size, in
         return MP_STREAM_ERROR;
     }
 
+    // Store the current SSL context.
+    store_active_context(o->ssl_context);
+
     int ret = mbedtls_ssl_write(&o->ssl, buf, size);
     if (ret >= 0) {
         return ret;
@@ -693,6 +715,9 @@ static mp_uint_t socket_ioctl(mp_obj_t o_in, mp_uint_t request, uintptr_t arg, i
     mp_obj_t sock = self->sock;
 
     if (request == MP_STREAM_CLOSE) {
+        // Clear the SSL context.
+        store_active_context(NULL);
+
         if (sock == MP_OBJ_NULL) {
             // Already closed socket, do nothing.
             return 0;
@@ -779,6 +804,57 @@ static MP_DEFINE_CONST_OBJ_TYPE(
 
 /******************************************************************************/
 // ssl module.
+
+#if MICROPY_PY_SSL_ECDSA_SIGN_ALT
+int micropy_mbedtls_ecdsa_sign_alt(const mbedtls_mpi *d, const unsigned char *hash, size_t hlen, unsigned char *sig, size_t sig_size, size_t *slen) {
+    uint8_t key[256];
+
+    // Check if the current context has an alternative sign function.
+    mp_obj_ssl_context_t *ssl_ctx = MP_STATE_THREAD(tls_ssl_context);
+    if (ssl_ctx == NULL || ssl_ctx->ecdsa_sign_callback == mp_const_none) {
+        return MBEDTLS_ERR_PLATFORM_FEATURE_UNSUPPORTED;
+    }
+
+    size_t klen = mbedtls_mpi_size(d);
+    if (klen > sizeof(key)) {
+        return MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+    }
+
+    // Convert the MPI private key (d) to a binary array
+    if (mbedtls_mpi_write_binary(d, key, klen) != 0) {
+        return MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+    }
+
+    nlr_buf_t nlr;
+    mp_buffer_info_t sig_buf;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t ret = mp_call_function_2(ssl_ctx->ecdsa_sign_callback,
+            mp_obj_new_bytearray_by_ref(klen, (void *)key),
+            mp_obj_new_bytearray_by_ref(hlen, (void *)hash));
+        if (ret == mp_const_none) {
+            // key couldn't be used by the alternative implementation.
+            nlr_pop();
+            return MBEDTLS_ERR_PLATFORM_FEATURE_UNSUPPORTED;
+        }
+        mp_get_buffer_raise(ret, &sig_buf, MP_BUFFER_READ);
+        nlr_pop();
+    } else {
+        // The alternative implementation failed to sign.
+        mp_obj_print_exception(&mp_plat_print, MP_OBJ_FROM_PTR(nlr.ret_val));
+        return MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+    }
+
+    // Check if the buffer fits.
+    if (sig_buf.len > sig_size) {
+        return MBEDTLS_ERR_ECP_BUFFER_TOO_SMALL;
+    }
+
+    // Copy ASN.1 signature to buffer.
+    *slen = sig_buf.len;
+    memcpy(sig, sig_buf.buf, sig_buf.len);
+    return 0;
+}
+#endif
 
 static const mp_rom_map_elem_t mp_module_tls_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_tls) },

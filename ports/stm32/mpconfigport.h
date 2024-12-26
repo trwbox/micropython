@@ -106,6 +106,7 @@
 #define MICROPY_PY_TIME_GMTIME_LOCALTIME_MKTIME (1)
 #define MICROPY_PY_TIME_TIME_TIME_NS (1)
 #define MICROPY_PY_TIME_INCLUDEFILE "ports/stm32/modtime.c"
+#define MICROPY_PY_LWIP_PPP         (MICROPY_PY_NETWORK_PPP_LWIP)
 #define MICROPY_PY_LWIP_SOCK_RAW    (MICROPY_PY_LWIP)
 #ifndef MICROPY_PY_MACHINE
 #define MICROPY_PY_MACHINE          (1)
@@ -156,7 +157,7 @@
 #endif
 
 // fatfs configuration used in ffconf.h
-#define MICROPY_FATFS_ENABLE_LFN       (1)
+#define MICROPY_FATFS_ENABLE_LFN       (2)
 #define MICROPY_FATFS_LFN_CODE_PAGE    437 /* 1=SFN/ANSI 437=LFN/U.S.(OEM) */
 #define MICROPY_FATFS_USE_LABEL        (1)
 #define MICROPY_FATFS_RPATH            (2)
