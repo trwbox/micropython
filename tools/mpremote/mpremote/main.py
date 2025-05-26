@@ -36,6 +36,7 @@ from .commands import (
     do_resume,
     do_rtc,
     do_soft_reset,
+    do_romfs,
 )
 from .mip import do_mip
 from .repl import do_repl
@@ -180,8 +181,12 @@ def argparse_rtc():
 
 
 def argparse_filesystem():
-    cmd_parser = argparse.ArgumentParser(description="execute filesystem commands on the device")
-    _bool_flag(cmd_parser, "recursive", "r", False, "recursive copy (for cp command only)")
+    cmd_parser = argparse.ArgumentParser(
+        description="execute filesystem commands on the device",
+        add_help=False,
+    )
+    cmd_parser.add_argument("--help", action="help", help="show this help message and exit")
+    _bool_flag(cmd_parser, "recursive", "r", False, "recursive (for cp and rm commands)")
     _bool_flag(
         cmd_parser,
         "force",
@@ -196,10 +201,26 @@ def argparse_filesystem():
         None,
         "enable verbose output (defaults to True for all commands except cat)",
     )
+    size_group = cmd_parser.add_mutually_exclusive_group()
+    size_group.add_argument(
+        "--size",
+        "-s",
+        default=False,
+        action="store_true",
+        help="show file size in bytes(tree command only)",
+    )
+    size_group.add_argument(
+        "--human",
+        "-h",
+        default=False,
+        action="store_true",
+        help="show file size in a more human readable way (tree command only)",
+    )
+
     cmd_parser.add_argument(
         "command",
         nargs=1,
-        help="filesystem command (e.g. cat, cp, sha256sum, ls, rm, rmdir, touch)",
+        help="filesystem command (e.g. cat, cp, sha256sum, ls, rm, rmdir, touch, tree)",
     )
     cmd_parser.add_argument("path", nargs="+", help="local and remote paths")
     return cmd_parser
@@ -225,6 +246,32 @@ def argparse_mip():
         nargs="+",
         help="list package specifications, e.g. name, name@version, github:org/repo, github:org/repo@branch, gitlab:org/repo, gitlab:org/repo@branch",
     )
+    return cmd_parser
+
+
+def argparse_romfs():
+    cmd_parser = argparse.ArgumentParser(description="manage ROM partitions")
+    _bool_flag(
+        cmd_parser,
+        "mpy",
+        "m",
+        True,
+        "automatically compile .py files to .mpy when building the ROMFS image (default)",
+    )
+    cmd_parser.add_argument(
+        "--partition",
+        "-p",
+        type=int,
+        default=0,
+        help="ROMFS partition to use",
+    )
+    cmd_parser.add_argument(
+        "--output",
+        "-o",
+        help="output file",
+    )
+    cmd_parser.add_argument("command", nargs=1, help="romfs command, one of: query, build, deploy")
+    cmd_parser.add_argument("path", nargs="?", help="path to directory to deploy")
     return cmd_parser
 
 
@@ -302,6 +349,10 @@ _COMMANDS = {
         do_version,
         argparse_none("print version and exit"),
     ),
+    "romfs": (
+        do_romfs,
+        argparse_romfs,
+    ),
 }
 
 # Additional commands aliases.
@@ -324,6 +375,7 @@ _BUILTIN_COMMAND_EXPANSIONS = {
     "rmdir": "fs rmdir",
     "sha256sum": "fs sha256sum",
     "touch": "fs touch",
+    "tree": "fs tree",
     # Disk used/free.
     "df": [
         "exec",
@@ -521,8 +573,13 @@ def main():
                 command_args = remaining_args
                 extra_args = []
 
-            # Special case: "fs ls" allowed have no path specified.
-            if cmd == "fs" and len(command_args) == 1 and command_args[0] == "ls":
+            # Special case: "fs ls" and "fs tree" can have only options and no path specified.
+            if (
+                cmd == "fs"
+                and len(command_args) >= 1
+                and command_args[0] in ("ls", "tree")
+                and sum(1 for a in command_args if not a.startswith('-')) == 1
+            ):
                 command_args.append("")
 
             # Use the command-specific argument parser.

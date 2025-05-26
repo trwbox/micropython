@@ -184,12 +184,13 @@ static inline bool mp_obj_is_small_int(mp_const_obj_t o) {
 #define MP_OBJ_NEW_SMALL_INT(small_int) ((mp_obj_t)((((mp_uint_t)(small_int)) << 1) | 1))
 
 #if MICROPY_PY_BUILTINS_FLOAT
-#define mp_const_float_e MP_ROM_PTR((mp_obj_t)(((0x402df854 & ~3) | 2) + 0x80800000))
-#define mp_const_float_pi MP_ROM_PTR((mp_obj_t)(((0x40490fdb & ~3) | 2) + 0x80800000))
+#define MP_OBJ_NEW_CONST_FLOAT(f) MP_ROM_PTR((mp_obj_t)((((((uint64_t)f) & ~3) | 2) + 0x80800000) & 0xffffffff))
+#define mp_const_float_e  MP_OBJ_NEW_CONST_FLOAT(0x402df854)
+#define mp_const_float_pi MP_OBJ_NEW_CONST_FLOAT(0x40490fdb)
 #if MICROPY_PY_MATH_CONSTANTS
-#define mp_const_float_tau MP_ROM_PTR((mp_obj_t)(((0x40c90fdb & ~3) | 2) + 0x80800000))
-#define mp_const_float_inf MP_ROM_PTR((mp_obj_t)(((0x7f800000 & ~3) | 2) + 0x80800000))
-#define mp_const_float_nan MP_ROM_PTR((mp_obj_t)(((0xffc00000 & ~3) | 2) + 0x80800000))
+#define mp_const_float_tau MP_OBJ_NEW_CONST_FLOAT(0x40c90fdb)
+#define mp_const_float_inf MP_OBJ_NEW_CONST_FLOAT(0x7f800000)
+#define mp_const_float_nan MP_OBJ_NEW_CONST_FLOAT(0xffc00000)
 #endif
 
 static inline bool mp_obj_is_float(mp_const_obj_t o) {
@@ -202,7 +203,7 @@ static inline mp_float_t mp_obj_float_get(mp_const_obj_t o) {
     union {
         mp_float_t f;
         mp_uint_t u;
-    } num = {.u = ((mp_uint_t)o - 0x80800000) & ~3};
+    } num = {.u = ((mp_uint_t)o - 0x80800000u) & ~3u};
     return num.f;
 }
 static inline mp_obj_t mp_obj_new_float(mp_float_t f) {
@@ -210,7 +211,7 @@ static inline mp_obj_t mp_obj_new_float(mp_float_t f) {
         mp_float_t f;
         mp_uint_t u;
     } num = {.f = f};
-    return (mp_obj_t)(((num.u & ~0x3) | 2) + 0x80800000);
+    return (mp_obj_t)(((num.u & ~0x3u) | 2u) + 0x80800000u);
 }
 #endif
 
@@ -370,25 +371,25 @@ typedef struct _mp_rom_obj_t { mp_const_obj_t o; } mp_rom_obj_t;
 
 #define MP_DEFINE_CONST_FUN_OBJ_0(obj_name, fun_name) \
     const mp_obj_fun_builtin_fixed_t obj_name = \
-    {{&mp_type_fun_builtin_0}, .fun._0 = fun_name}
+    {.base = {.type = &mp_type_fun_builtin_0}, .fun = {._0 = fun_name}}
 #define MP_DEFINE_CONST_FUN_OBJ_1(obj_name, fun_name) \
     const mp_obj_fun_builtin_fixed_t obj_name = \
-    {{&mp_type_fun_builtin_1}, .fun._1 = fun_name}
+    {.base = {.type = &mp_type_fun_builtin_1}, .fun = {._1 = fun_name}}
 #define MP_DEFINE_CONST_FUN_OBJ_2(obj_name, fun_name) \
     const mp_obj_fun_builtin_fixed_t obj_name = \
-    {{&mp_type_fun_builtin_2}, .fun._2 = fun_name}
+    {.base = {.type = &mp_type_fun_builtin_2}, .fun = {._2 = fun_name}}
 #define MP_DEFINE_CONST_FUN_OBJ_3(obj_name, fun_name) \
     const mp_obj_fun_builtin_fixed_t obj_name = \
-    {{&mp_type_fun_builtin_3}, .fun._3 = fun_name}
+    {.base = {.type = &mp_type_fun_builtin_3}, .fun = {._3 = fun_name}}
 #define MP_DEFINE_CONST_FUN_OBJ_VAR(obj_name, n_args_min, fun_name) \
     const mp_obj_fun_builtin_var_t obj_name = \
-    {{&mp_type_fun_builtin_var}, MP_OBJ_FUN_MAKE_SIG(n_args_min, MP_OBJ_FUN_ARGS_MAX, false), .fun.var = fun_name}
+    {.base = {.type = &mp_type_fun_builtin_var}, .sig = MP_OBJ_FUN_MAKE_SIG(n_args_min, MP_OBJ_FUN_ARGS_MAX, false), .fun = {.var = fun_name}}
 #define MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(obj_name, n_args_min, n_args_max, fun_name) \
     const mp_obj_fun_builtin_var_t obj_name = \
-    {{&mp_type_fun_builtin_var}, MP_OBJ_FUN_MAKE_SIG(n_args_min, n_args_max, false), .fun.var = fun_name}
+    {.base = {.type = &mp_type_fun_builtin_var}, .sig = MP_OBJ_FUN_MAKE_SIG(n_args_min, n_args_max, false), .fun = {.var = fun_name}}
 #define MP_DEFINE_CONST_FUN_OBJ_KW(obj_name, n_args_min, fun_name) \
     const mp_obj_fun_builtin_var_t obj_name = \
-    {{&mp_type_fun_builtin_var}, MP_OBJ_FUN_MAKE_SIG(n_args_min, MP_OBJ_FUN_ARGS_MAX, true), .fun.kw = fun_name}
+    {.base = {.type = &mp_type_fun_builtin_var}, .sig = MP_OBJ_FUN_MAKE_SIG(n_args_min, MP_OBJ_FUN_ARGS_MAX, true), .fun = {.kw = fun_name}}
 
 // These macros are used to define constant map/dict objects
 // You can put "static" in front of the definition to make it local
@@ -839,6 +840,7 @@ extern const mp_obj_type_t mp_type_fun_bc;
 extern const mp_obj_type_t mp_type_fun_native;
 extern const mp_obj_type_t mp_type_fun_viper;
 extern const mp_obj_type_t mp_type_fun_asm;
+extern const mp_obj_type_t mp_type_code;
 extern const mp_obj_type_t mp_type_module;
 extern const mp_obj_type_t mp_type_staticmethod;
 extern const mp_obj_type_t mp_type_classmethod;
