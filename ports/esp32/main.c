@@ -199,6 +199,7 @@ soft_reset_exit:
     // TODO: machine_rmt_deinit_all();
     machine_pins_deinit();
     machine_deinit();
+    network_wlan_deinit();
     #if MICROPY_PY_SOCKET_EVENTS
     socket_events_deinit();
     #endif
