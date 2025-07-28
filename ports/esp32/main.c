@@ -51,6 +51,7 @@
 #include "py/repl.h"
 #include "py/gc.h"
 #include "py/mphal.h"
+#include "extmod/modmachine.h"
 #include "shared/readline/readline.h"
 #include "shared/runtime/pyexec.h"
 #include "shared/timeutils/timeutils.h"
@@ -199,8 +200,15 @@ soft_reset_exit:
     machine_pwm_deinit_all();
     // TODO: machine_rmt_deinit_all();
     machine_pins_deinit();
+    #if MICROPY_PY_MACHINE_I2C_TARGET
+    mp_machine_i2c_target_deinit_all();
+    #endif
     machine_deinit();
+<<<<<<< HEAD
     network_wlan_deinit();
+=======
+
+>>>>>>> 7bc83afee (esp32/machine_i2c_target: Implement I2CTarget class.)
     #if MICROPY_PY_SOCKET_EVENTS
     socket_events_deinit();
     #endif
